@@ -1,9 +1,10 @@
 package api
 
 import (
-	"hive/internal/hive"
 	"net/http"
 	"os"
+
+	"github.com/DedLad/hive/internal/hive"
 
 	"github.com/gin-gonic/gin"
 )

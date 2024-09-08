@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -14,6 +15,12 @@ type Bitcask struct {
 }
 
 func NewBitcask(filePath string) (*Bitcask, error) {
+	dir := filepath.Dir(filePath)
+	err := os.MkdirAll(dir, os.ModePerm)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create storage directory: %v", err)
+	}
+
 	file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0666)
 	if err != nil {
 		return nil, err

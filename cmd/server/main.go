@@ -1,8 +1,9 @@
 package main
 
 import (
-	"hive/config"
-	"hive/internal/api"
+	"github.com/DedLad/hive/internal/api"
+
+	"github.com/DedLad/hive/config"
 
 	"github.com/gin-gonic/gin"
 )
