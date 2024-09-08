@@ -1,0 +1,8 @@
+# hive
+
+## What is this?
+implementing a Bitcask storage system in golang.
+
+## Now, what is bitcask?
+Bitcask is a log-structured storage system that aims for performant reads and writes. Majorly used in KV stores and DBs. Bitcask organizes data into a logfile, where every write op appends new data to the EOF. This allows for 'hopefully' fast writes and sequential reads.
+
