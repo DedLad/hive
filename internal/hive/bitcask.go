@@ -154,7 +154,7 @@ func (bc *Bitcask) Compact() error {
 	}
 
 	// Rewrite the filtered data back to the same database file
-	err = ioutil.WriteFile(bc.dbPath, []byte(strings.Join(compactedData, "\n")), 0644)
+	err = os.WriteFile(bc.dbPath, []byte(strings.Join(compactedData, "\n")), 0644)
 	if err != nil {
 		return fmt.Errorf("failed to write compacted data to DB file: %w", err)
 	}
