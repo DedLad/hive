@@ -3,7 +3,6 @@ package hive
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"strings"
 	"sync"
@@ -125,7 +124,7 @@ func (bc *Bitcask) Compact() error {
 	defer bc.mu.Unlock()
 
 	// Read the current database file
-	data, err := ioutil.ReadFile(bc.dbPath)
+	data, err := os.ReadFile(bc.dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to read DB file: %w", err)
 	}
