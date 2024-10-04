@@ -48,6 +48,7 @@ func NewBitcask(walPath, dbPath string) (*Bitcask, error) {
 
 	return bc, nil
 }
+
 func (bc *Bitcask) Put(key, value string) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
@@ -72,6 +73,7 @@ func (bc *Bitcask) Delete(key string) error {
 		return err
 	}
 
+	// Mark the key as a tombstone in the .db file
 	if _, err := bc.dbFile.WriteString(fmt.Sprintf("%s:%s\n", key, "__DELETED__")); err != nil {
 		return err
 	}
@@ -86,6 +88,9 @@ func (bc *Bitcask) Get(key string) (string, error) {
 
 	value, exists := bc.data[key]
 	if !exists {
+		return "", errors.New("key not found")
+	}
+	if value == "__DELETED__" {
 		return "", errors.New("key not found")
 	}
 	return value, nil

@@ -20,6 +20,7 @@ func init() {
 		panic("Failed to initialize Bitcask: " + err.Error())
 	}
 }
+
 func RegisterRoutes(router *gin.Engine) {
 	router.POST("/put/:key_value", PutHandler)
 	router.GET("/get/:key", GetHandler)
