@@ -4,28 +4,35 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sync"
-	"time"
 )
 
 type Bitcask struct {
 	data    map[string]string
 	wal     *WAL
+	dbFile  *os.File
 	mu      sync.RWMutex // Mutex for concurrent access
 	walPath string       // Path to the WAL file
+	dbPath  string       // Path to the DB file
 }
 
-func NewBitcask(walPath string) (*Bitcask, error) {
+func NewBitcask(walPath, dbPath string) (*Bitcask, error) {
 	wal, err := NewWAL(walPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize WAL: %w", err)
 	}
 
+	dbFile, err := os.OpenFile(dbPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open DB file: %w", err)
+	}
+
 	bc := &Bitcask{
 		data:    make(map[string]string),
 		wal:     wal,
+		dbFile:  dbFile,
 		walPath: walPath,
+		dbPath:  dbPath,
 	}
 
 	err = wal.Replay(func(operation, key, value string, timestamp int64) {
@@ -41,7 +48,6 @@ func NewBitcask(walPath string) (*Bitcask, error) {
 
 	return bc, nil
 }
-
 func (bc *Bitcask) Put(key, value string) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
@@ -50,7 +56,27 @@ func (bc *Bitcask) Put(key, value string) error {
 		return err
 	}
 
+	if _, err := bc.dbFile.WriteString(fmt.Sprintf("%s:%s\n", key, value)); err != nil {
+		return err
+	}
+
 	bc.data[key] = value
+	return nil
+}
+
+func (bc *Bitcask) Delete(key string) error {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	if err := bc.wal.Append("DELETE", key, ""); err != nil {
+		return err
+	}
+
+	if _, err := bc.dbFile.WriteString(fmt.Sprintf("%s:%s\n", key, "__DELETED__")); err != nil {
+		return err
+	}
+
+	delete(bc.data, key)
 	return nil
 }
 
@@ -63,19 +89,6 @@ func (bc *Bitcask) Get(key string) (string, error) {
 		return "", errors.New("key not found")
 	}
 	return value, nil
-}
-
-func (bc *Bitcask) Delete(key string) error {
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
-
-	delete(bc.data, key)
-
-	if err := bc.wal.Append("DELETE", key, ""); err != nil {
-		return err
-	}
-
-	return nil
 }
 
 func (bc *Bitcask) Compact() error {
@@ -96,25 +109,14 @@ func (bc *Bitcask) Compact() error {
 
 	for key, value := range bc.data {
 		if value != "__DELETED__" {
-			_, err := tempFile.WriteString(fmt.Sprintf("PUT|%s|%s|%d\n", key, value, time.Now().Unix()))
+			_, err := tempFile.WriteString(fmt.Sprintf("%s:%s\n", key, value))
 			if err != nil {
 				return fmt.Errorf("failed to write to temp file: %w", err)
 			}
 		}
 	}
 
-	dataFiles, err := filepath.Glob("./data/bitcask*.db")
-	if err != nil {
-		return fmt.Errorf("failed to find data files: %w", err)
-	}
-
-	for _, file := range dataFiles {
-		if err := os.Remove(file); err != nil {
-			return fmt.Errorf("failed to remove old data file %s: %w", file, err)
-		}
-	}
-
-	err = os.Rename(tempFilePath, "./data/bitcask.db")
+	err = os.Rename(tempFilePath, bc.dbPath)
 	if err != nil {
 		return fmt.Errorf("failed to rename temp file: %w", err)
 	}

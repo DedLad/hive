@@ -46,3 +46,25 @@ func (wal *WAL) Replay(callback func(operation, key, value string, timestamp int
 func (wal *WAL) Close() error {
 	return wal.file.Close()
 }
+func (bc *Bitcask) ArchiveWAL() error {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	err := bc.wal.Close()
+	if err != nil {
+		return fmt.Errorf("failed to close WAL: %w", err)
+	}
+
+	archivePath := bc.walPath + ".archive"
+	err = os.Rename(bc.walPath, archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to archive WAL: %w", err)
+	}
+
+	bc.wal, err = NewWAL(bc.walPath)
+	if err != nil {
+		return fmt.Errorf("failed to initialize new WAL: %w", err)
+	}
+
+	return nil
+}

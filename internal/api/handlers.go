@@ -2,7 +2,6 @@ package api
 
 import (
 	"net/http"
-	"os"
 	"strings"
 
 	"github.com/DedLad/hive/internal/hive"
@@ -12,18 +11,15 @@ import (
 var bitcask *hive.Bitcask
 
 func init() {
-	storagePath := os.Getenv("STORAGE_PATH")
-	if storagePath == "" {
-		storagePath = "./data/bitcask.db"
-	}
+	walPath := "./data/bitcask.wal"
+	dbPath := "./data/bitcask.db"
 
 	var err error
-	bitcask, err = hive.NewBitcask(storagePath)
+	bitcask, err = hive.NewBitcask(walPath, dbPath)
 	if err != nil {
 		panic("Failed to initialize Bitcask: " + err.Error())
 	}
 }
-
 func RegisterRoutes(router *gin.Engine) {
 	router.POST("/put/:key_value", PutHandler)
 	router.GET("/get/:key", GetHandler)
