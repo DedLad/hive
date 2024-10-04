@@ -3,8 +3,9 @@ package hive
 import (
 	"errors"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -123,51 +124,39 @@ func (bc *Bitcask) Compact() error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
-	// Clone and archive the current database file
-	archivePath := fmt.Sprintf("%s_%d", bc.dbPath, time.Now().Unix())
-	err := copyFile(bc.dbPath, archivePath)
+	// Read the current database file
+	data, err := ioutil.ReadFile(bc.dbPath)
 	if err != nil {
-		return fmt.Errorf("failed to archive current DB file: %w", err)
+		return fmt.Errorf("failed to read DB file: %w", err)
 	}
 
-	tempFilePath := "./data/temp_compacted.db"
-	tempFile, err := os.Create(tempFilePath)
-	if err != nil {
-		return fmt.Errorf("failed to create temp file: %w", err)
+	// Use a map to keep track of the latest values for each key
+	latestData := make(map[string]string)
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key, value := parts[0], parts[1]
+		latestData[key] = value
 	}
-	defer tempFile.Close()
 
-	for key, value := range bc.data {
+	// Filter out tombstones and prepare compacted data
+	var compactedData []string
+	for key, value := range latestData {
 		if value != "__DELETED__" {
-			_, err := tempFile.WriteString(fmt.Sprintf("%s:%s\n", key, value))
-			if err != nil {
-				return fmt.Errorf("failed to write to temp file: %w", err)
-			}
+			compactedData = append(compactedData, fmt.Sprintf("%s:%s", key, value))
 		}
 	}
 
-	// Close the current database file before replacing it
-	err = bc.dbFile.Close()
+	// Rewrite the filtered data back to the same database file
+	err = ioutil.WriteFile(bc.dbPath, []byte(strings.Join(compactedData, "\n")), 0644)
 	if err != nil {
-		return fmt.Errorf("failed to close DB file before compaction: %w", err)
-	}
-
-	// Delete the original database file
-	err = os.Remove(bc.dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to delete original DB file: %w", err)
-	}
-
-	// Move the temporary file to the original file's location
-	err = os.Rename(tempFilePath, bc.dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to move temp file to original location: %w", err)
-	}
-
-	// Reopen the database file immediately after moving the temporary file
-	bc.dbFile, err = os.OpenFile(bc.dbPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return fmt.Errorf("failed to reopen DB file: %w", err)
+		return fmt.Errorf("failed to write compacted data to DB file: %w", err)
 	}
 
 	// Reopen the WAL file before logging the compaction operation
@@ -190,26 +179,4 @@ func (bc *Bitcask) checkCompaction() {
 	if bc.logCount >= 30 {
 		go bc.Compact()
 	}
-}
-
-// BRO CBA
-func copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	_, err = io.Copy(destFile, sourceFile)
-	if err != nil {
-		return err
-	}
-
-	return destFile.Sync()
 }
