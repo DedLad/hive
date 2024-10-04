@@ -3,9 +3,9 @@ package api
 import (
 	"net/http"
 	"os"
+	"strings"
 
 	"github.com/DedLad/hive/internal/hive"
-
 	"github.com/gin-gonic/gin"
 )
 
@@ -25,25 +25,29 @@ func init() {
 }
 
 func RegisterRoutes(router *gin.Engine) {
-	router.PUT("/put", PutHandler)
+	router.POST("/put/:key_value", PutHandler)
 	router.GET("/get/:key", GetHandler)
 	router.DELETE("/delete/:key", DeleteHandler)
+	router.POST("/compact", CompactHandler)
 }
 
 func PutHandler(c *gin.Context) {
-	var req map[string]string
-	if err := c.BindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input"})
+	keyValue := c.Param("key_value")
+	parts := strings.SplitN(keyValue, ":", 2)
+	if len(parts) != 2 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid input format. Expected /put/{KEY}:{VALUE}"})
 		return
 	}
 
-	for key, value := range req {
-		if err := bitcask.Put(key, value); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
+	key := parts[0]
+	value := parts[1]
+
+	if err := bitcask.Put(key, value); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
-	c.JSON(http.StatusOK, gin.H{"message": "Successfully stored"})
+
+	c.JSON(http.StatusOK, gin.H{"message": "Successfully stored", "key": key, "value": value})
 }
 
 func GetHandler(c *gin.Context) {
@@ -63,4 +67,14 @@ func DeleteHandler(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Successfully deleted"})
+}
+
+func CompactHandler(c *gin.Context) {
+	err := bitcask.Compact()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Compaction failed: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Compaction completed successfully"})
 }
