@@ -11,11 +11,10 @@ import (
 var bitcask *hive.Bitcask
 
 func init() {
-	walPath := "./data/bitcask.wal"
-	dbPath := "./data/bitcask.db"
+	dataDir := "./data"
 
 	var err error
-	bitcask, err = hive.NewBitcask(walPath, dbPath)
+	bitcask, err = hive.NewBitcask(dataDir)
 	if err != nil {
 		panic("Failed to initialize Bitcask: " + err.Error())
 	}
@@ -60,7 +59,7 @@ func GetHandler(c *gin.Context) {
 func DeleteHandler(c *gin.Context) {
 	key := c.Param("key")
 	if err := bitcask.Delete(key); err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "Successfully deleted"})

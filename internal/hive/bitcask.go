@@ -1,104 +1,145 @@
 package hive
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-type Bitcask struct {
-	data       map[string]string
-	wal        *WAL
-	dbFile     *os.File
-	mu         sync.RWMutex // Mutex for concurrent access
-	walPath    string       // Path to the WAL file
-	dbPath     string       // Path to the DB file
-	logCount   int          // Count of logs in the WAL
-	compactMux sync.Mutex   // Mutex for compaction
+const (
+	dataFileSizeThreshold   = 100 // 100 bytes
+	compactionFileThreshold = 4
+)
+
+type KeyDirEntry struct {
+	FileID    int
+	Offset    int64
+	Timestamp int64
 }
 
-func NewBitcask(walPath, dbPath string) (*Bitcask, error) {
-	wal, err := NewWAL(walPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to initialize WAL: %w", err)
-	}
+type Bitcask struct {
+	dataDir    string
+	keyDir     map[string]KeyDirEntry
+	dataFiles  []*os.File
+	activeFile *os.File
+	mu         sync.RWMutex
+	compactMux sync.Mutex
+}
 
-	dbFile, err := os.OpenFile(dbPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open DB file: %w", err)
-	}
-
+func NewBitcask(dataDir string) (*Bitcask, error) {
 	bc := &Bitcask{
-		data:    make(map[string]string),
-		wal:     wal,
-		dbFile:  dbFile,
-		walPath: walPath,
-		dbPath:  dbPath,
+		dataDir: dataDir,
+		keyDir:  make(map[string]KeyDirEntry),
 	}
 
-	err = wal.Replay(func(operation, key, value string, timestamp int64) {
-		if operation == "PUT" {
-			bc.data[key] = value
-		} else if operation == "DELETE" {
-			bc.data[key] = "__DELETED__"
-		}
-		bc.logCount++
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to replay WAL: %w", err)
+	if err := bc.loadDataFiles(); err != nil {
+		return nil, fmt.Errorf("failed to load data files: %w", err)
 	}
-
-	go bc.periodicCompaction()
 
 	return bc, nil
 }
 
-func (bc *Bitcask) periodicCompaction() {
-	ticker := time.NewTicker(90 * time.Second)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		bc.Compact()
+func (bc *Bitcask) loadDataFiles() error {
+	files, err := filepath.Glob(filepath.Join(bc.dataDir, "*.data"))
+	if err != nil {
+		return err
 	}
+
+	for _, file := range files {
+		f, err := os.OpenFile(file, os.O_RDWR, 0644)
+		if err != nil {
+			return err
+		}
+		bc.dataFiles = append(bc.dataFiles, f)
+		if err := bc.loadKeyDir(f); err != nil {
+			return err
+		}
+	}
+
+	activeFile, err := os.OpenFile(filepath.Join(bc.dataDir, fmt.Sprintf("%d.data", len(bc.dataFiles))), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	bc.activeFile = activeFile
+	bc.dataFiles = append(bc.dataFiles, activeFile)
+
+	return nil
+}
+
+func (bc *Bitcask) loadKeyDir(file *os.File) error {
+	scanner := bufio.NewScanner(file)
+	var offset int64
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, "|")
+		if len(parts) != 5 {
+			continue
+		}
+
+		timestamp, err := strconv.ParseInt(parts[4], 10, 64)
+		if err != nil {
+			return err
+		}
+
+		key := parts[0]
+		bc.keyDir[key] = KeyDirEntry{
+			FileID:    len(bc.dataFiles) - 1,
+			Offset:    offset,
+			Timestamp: timestamp,
+		}
+		offset += int64(len(line) + 1)
+	}
+	return scanner.Err()
 }
 
 func (bc *Bitcask) Put(key, value string) error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
-	if err := bc.wal.Append("PUT", key, value); err != nil {
+	timestamp := time.Now().Unix()
+	entry := fmt.Sprintf("%s|%s|%d|%d|%d\n", key, value, len(key), len(value), timestamp)
+	if _, err := bc.activeFile.WriteString(entry); err != nil {
 		return err
 	}
 
-	if _, err := bc.dbFile.WriteString(fmt.Sprintf("%s:%s\n", key, value)); err != nil {
+	offset, err := bc.activeFile.Seek(0, os.SEEK_CUR)
+	if err != nil {
 		return err
 	}
 
-	bc.data[key] = value
-	bc.logCount++
-	bc.checkCompaction()
+	bc.keyDir[key] = KeyDirEntry{
+		FileID:    len(bc.dataFiles) - 1,
+		Offset:    offset - int64(len(entry)),
+		Timestamp: timestamp,
+	}
+
+	if offset >= dataFileSizeThreshold {
+		if err := bc.rotateActiveFile(); err != nil {
+			return err
+		}
+	}
+
+	if len(bc.dataFiles) > compactionFileThreshold {
+		go bc.Compact()
+	}
+
 	return nil
 }
 
-func (bc *Bitcask) Delete(key string) error {
-	bc.mu.Lock()
-	defer bc.mu.Unlock()
-
-	if err := bc.wal.Append("DELETE", key, ""); err != nil {
+func (bc *Bitcask) rotateActiveFile() error {
+	bc.activeFile.Close()
+	newFile, err := os.OpenFile(filepath.Join(bc.dataDir, fmt.Sprintf("%d.data", len(bc.dataFiles))), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
 		return err
 	}
-
-	// Mark the key as a tombstone in the .db file
-	if _, err := bc.dbFile.WriteString(fmt.Sprintf("%s:%s\n", key, "__DELETED__")); err != nil {
-		return err
-	}
-
-	bc.data[key] = "__DELETED__"
-	bc.logCount++
-	bc.checkCompaction()
+	bc.activeFile = newFile
+	bc.dataFiles = append(bc.dataFiles, newFile)
 	return nil
 }
 
@@ -106,14 +147,71 @@ func (bc *Bitcask) Get(key string) (string, error) {
 	bc.mu.RLock()
 	defer bc.mu.RUnlock()
 
-	value, exists := bc.data[key]
+	entry, exists := bc.keyDir[key]
 	if !exists {
 		return "", errors.New("key not found")
 	}
-	if value == "__DELETED__" {
+
+	if entry.FileID < 0 || entry.FileID >= len(bc.dataFiles) {
+		return "", errors.New("invalid file ID")
+	}
+
+	file := bc.dataFiles[entry.FileID]
+	file.Seek(entry.Offset, os.SEEK_SET)
+
+	reader := bufio.NewReader(file)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+
+	parts := strings.Split(line, "|")
+	if len(parts) != 5 {
+		return "", errors.New("invalid data format")
+	}
+
+	if parts[1] == "TOMBSTONE" {
 		return "", errors.New("key not found")
 	}
+
+	value := parts[1]
 	return value, nil
+}
+
+func (bc *Bitcask) Delete(key string) error {
+	bc.mu.Lock()
+	defer bc.mu.Unlock()
+
+	timestamp := time.Now().Unix()
+	entry := fmt.Sprintf("%s|%s|%d|%d|%d\n", key, "TOMBSTONE", len(key), 0, timestamp)
+	if _, err := bc.activeFile.WriteString(entry); err != nil {
+		return err
+	}
+
+	delete(bc.keyDir, key)
+
+	offset, err := bc.activeFile.Seek(0, os.SEEK_CUR)
+	if err != nil {
+		return err
+	}
+
+	bc.keyDir[key] = KeyDirEntry{
+		FileID:    len(bc.dataFiles) - 1,
+		Offset:    offset - int64(len(entry)),
+		Timestamp: timestamp,
+	}
+
+	if offset >= dataFileSizeThreshold {
+		if err := bc.rotateActiveFile(); err != nil {
+			return err
+		}
+	}
+
+	if len(bc.dataFiles) > compactionFileThreshold {
+		go bc.Compact()
+	}
+
+	return nil
 }
 
 func (bc *Bitcask) Compact() error {
@@ -123,59 +221,75 @@ func (bc *Bitcask) Compact() error {
 	bc.mu.Lock()
 	defer bc.mu.Unlock()
 
-	// Read the current database file
-	data, err := os.ReadFile(bc.dbPath)
-	if err != nil {
-		return fmt.Errorf("failed to read DB file: %w", err)
+	compactedFileIndex := 0
+	for {
+		if _, err := os.Stat(filepath.Join(bc.dataDir, fmt.Sprintf("compacted%d.data", compactedFileIndex))); os.IsNotExist(err) {
+			break
+		}
+		compactedFileIndex++
 	}
+	compactedFileName := filepath.Join(bc.dataDir, fmt.Sprintf("compacted%d.data", compactedFileIndex))
 
-	// Use a map to keep track of the latest values for each key
-	latestData := make(map[string]string)
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if line == "" {
+	compactedFile, err := os.OpenFile(compactedFileName, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	defer compactedFile.Close()
+
+	for key, entry := range bc.keyDir {
+		if entry.FileID >= len(bc.dataFiles) {
 			continue
 		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
+		file := bc.dataFiles[entry.FileID]
+		file.Seek(entry.Offset, os.SEEK_SET)
+
+		reader := bufio.NewReader(file)
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
+		}
+
+		parts := strings.Split(line, "|")
+		if len(parts) != 5 {
+			return errors.New("invalid data format")
+		}
+
+		if parts[1] == "TOMBSTONE" {
 			continue
 		}
-		key, value := parts[0], parts[1]
-		latestData[key] = value
-	}
 
-	// Filter out tombstones and prepare compacted data
-	var compactedData []string
-	for key, value := range latestData {
-		if value != "__DELETED__" {
-			compactedData = append(compactedData, fmt.Sprintf("%s:%s", key, value))
+		if _, err := compactedFile.WriteString(line); err != nil {
+			return err
+		}
+
+		offset, err := compactedFile.Seek(0, os.SEEK_CUR)
+		if err != nil {
+			return err
+		}
+
+		bc.keyDir[key] = KeyDirEntry{
+			FileID:    len(bc.dataFiles),
+			Offset:    offset - int64(len(line)),
+			Timestamp: entry.Timestamp,
 		}
 	}
 
-	// Rewrite the filtered data back to the same database file
-	err = os.WriteFile(bc.dbPath, []byte(strings.Join(compactedData, "\n")), 0644)
-	if err != nil {
-		return fmt.Errorf("failed to write compacted data to DB file: %w", err)
+	for _, file := range bc.dataFiles {
+		file.Close()
+		os.Remove(file.Name())
 	}
 
-	// Reopen the WAL file before logging the compaction operation
-	bc.wal, err = NewWAL(bc.walPath)
+	compactedFile, err = os.OpenFile(compactedFileName, os.O_RDWR, 0644)
 	if err != nil {
-		return fmt.Errorf("failed to initialize new WAL: %w", err)
+		return err
 	}
 
-	// Log the compaction operation after reopening the WAL file
-	err = bc.wal.Append("COMPACT", "", "")
-	if err != nil {
-		return fmt.Errorf("failed to log compaction in WAL: %w", err)
+	bc.dataFiles = []*os.File{compactedFile}
+	bc.activeFile = compactedFile
+
+	if err := bc.rotateActiveFile(); err != nil {
+		return err
 	}
 
-	bc.logCount = 0
 	return nil
-}
-
-func (bc *Bitcask) checkCompaction() {
-	if bc.logCount >= 30 {
-		go bc.Compact()
-	}
 }
